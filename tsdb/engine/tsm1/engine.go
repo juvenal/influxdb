@@ -34,6 +34,7 @@ type DevEngine struct {
 	logger *log.Logger
 
 	WAL       *WAL
+	Cache     *Cache
 	Compactor *Compactor
 
 	RotateFileSize    uint32
@@ -55,6 +56,7 @@ func NewDevEngine(path string, walPath string, opt tsdb.EngineOptions) tsdb.Engi
 		logger: log.New(os.Stderr, "[tsm1dev] ", log.LstdFlags),
 
 		WAL:               w,
+		Cache:             NewCache(uint64(opt.Config.WALMaxMemorySizeThreshold)),
 		Compactor:         c,
 		RotateFileSize:    DefaultRotateFileSize,
 		MaxFileSize:       MaxDataFileSize,
@@ -120,7 +122,14 @@ func (e *DevEngine) WritePoints(points []models.Point, measurementFieldsToSave m
 		}
 	}
 
-	_, err := e.WAL.WritePoints(values)
+	id, err := e.WAL.WritePoints(values)
+
+	// Write data to cache for query purposes.
+	for k, v := range values {
+		if err := e.Cache.Write(k, v, uint64(id)); err != nil {
+			return err
+		}
+	}
 	return err
 }
 
@@ -168,17 +177,19 @@ func (e *DevEngine) compact() {
 		compact := segments[:n]
 
 		start := time.Now()
-		files, err := e.Compactor.Compact(compact)
+		files, err := e.Compactor.Compact(compact.Names())
 		if err != nil {
 			e.logger.Printf("error compacting WAL segments: %v", err)
 		}
 
 		// TODO: this is stubbed out but would be the place to replace files in the
 		// file store with the new compacted versions.
-		e.replaceFiles(files, compact)
+		e.replaceFiles(files, compact.Names())
 
-		// TODO: if replacement succeeds, we'd update the cache with the latest checkpoint.
-		// e.Cache.SetCheckpoint(...)
+		// Inform cache data may be evicted.
+		for _, id := range compact.IDs() {
+			e.Cache.SetCheckpoint(uint64(id))
+		}
 
 		e.logger.Printf("compacted %d segments into %d files in %s", len(compact), len(files), time.Since(start))
 	}
